@@ -137,6 +137,9 @@ enum quiche_error {
 
     /// An invalid DCID was used when connecting to a remote peer.
     QUICHE_ERR_INVALID_DCID_INITIALIZATION = -23,
+
+    // A version negotiation failure occurred, as per RFC 9368.
+    QUICHE_ERR_VERSION_NEGOTIATION = -24,
 };
 
 // Returns a human readable string with the quiche version number.

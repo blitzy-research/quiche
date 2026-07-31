@@ -115,6 +115,11 @@ pub enum Error {
 
     /// An invalid DCID was used when connecting to a remote peer.
     InvalidDcidInitialization,
+
+    /// The peer's Version Information carried a Chosen Version that does not
+    /// match the version in use for the connection, i.e. a version downgrade
+    /// was attempted, as per RFC 9368 Section 4.
+    VersionNegotiation,
 }
 
 /// QUIC error codes sent on the wire.
@@ -179,6 +184,12 @@ pub enum WireErrorCode {
     /// CONNECTION_CLOSE frame carrying this code except when the path does
     /// not support a large enough MTU.
     NoViablePath         = 0x10,
+    /// An endpoint received a `version_information` transport parameter whose
+    /// Chosen Version does not match the version in use for the connection.
+    ///
+    /// As defined in
+    /// [RFC9368](https://www.rfc-editor.org/rfc/rfc9368.html#section-4).
+    VersionNegotiationError = 0x11,
 }
 
 impl Error {
@@ -197,6 +208,8 @@ impl Error {
             Error::CryptoBufferExceeded =>
                 WireErrorCode::CryptoBufferExceeded as u64,
             Error::KeyUpdate => WireErrorCode::KeyUpdateError as u64,
+            Error::VersionNegotiation =>
+                WireErrorCode::VersionNegotiationError as u64,
             _ => WireErrorCode::ProtocolViolation as u64,
         }
     }
@@ -227,6 +240,7 @@ impl Error {
             Error::InvalidAckRange => -21,
             Error::OptimisticAckDetected => -22,
             Error::InvalidDcidInitialization => -23,
+            Error::VersionNegotiation => -24,
         }
     }
 }

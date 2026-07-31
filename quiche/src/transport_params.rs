@@ -26,6 +26,7 @@
 
 //! Transport parameters handling as per RFC 9000 Section 7.4
 //! Part of the Cryptographic and Transport Handshake
+//! The version_information parameter is defined by RFC 9368 Section 3
 
 use std::collections::HashSet;
 use std::mem::size_of;
@@ -146,6 +147,30 @@ impl<'a> Iterator for UnknownTransportParameterIterator<'a> {
     }
 }
 
+/// QUIC Version Information.
+///
+/// The value of the `version_information` transport parameter, as defined in
+/// [RFC 9368](https://www.rfc-editor.org/rfc/rfc9368.html#section-3), which an
+/// endpoint uses to advertise the version it selected for the connection and
+/// the versions it supports.
+///
+/// The Available Versions are held as a sequence rather than a set because
+/// their order is part of the value: a client lists them in order of
+/// descending preference.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersionInformation {
+    /// The version the sender is using for the current connection.
+    pub chosen_version: u32,
+
+    /// The versions the sender supports, in the order they appear on the
+    /// wire, i.e. as received from (or as they will be sent to) the peer.
+    ///
+    /// A client orders this list by descending preference, so the order is
+    /// part of the value and is never rearranged. A server is not required
+    /// to include its Chosen Version in the list, and the list may be empty.
+    pub available_versions: Vec<u32>,
+}
+
 /// QUIC Transport Parameters
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransportParams {
@@ -187,6 +212,8 @@ pub struct TransportParams {
     pub max_datagram_frame_size: Option<u64>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
+    /// Version Information, if any, as per RFC 9368 Section 3.
+    pub version_information: Option<VersionInformation>,
     // pub preferred_address: ...,
 }
 
@@ -211,6 +238,7 @@ impl Default for TransportParams {
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
             unknown_params: Default::default(),
+            version_information: None,
         }
     }
 }
@@ -239,7 +267,15 @@ impl TransportParams {
             }
             seen_params.insert(id);
 
-            let mut val = params.get_bytes_with_varint_length()?;
+            // A value whose declared length does not describe the bytes that
+            // follow it is badly formatted, which RFC 9000 Section 20.1 makes
+            // a TRANSPORT_PARAMETER_ERROR, and which RFC 9368 Section 4
+            // requires for a Version Information value that is too short.
+            // The mapping is applied to the shared framing step, so the close
+            // code is the same whichever parameter is malformed.
+            let mut val = params
+                .get_bytes_with_varint_length()
+                .map_err(|_| Error::InvalidTransportParam)?;
 
             match id {
                 0x0000 => {
@@ -364,6 +400,49 @@ impl TransportParams {
                     }
 
                     tp.retry_source_connection_id = Some(val.to_vec().into());
+                },
+
+                // Version Information, as per RFC 9368 Section 3: a 32-bit
+                // Chosen Version followed by the sender's Available Versions,
+                // each 32 bits long.
+                0x0011 => {
+                    // RFC 9368 Section 4: the value must carry a Chosen
+                    // Version and a whole number of Available Versions.
+                    // The Available Versions field may be empty, so a
+                    // 4-byte value is legal.
+                    if val.cap() < 4 || val.cap() % 4 != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    let chosen_version = val.get_u32()?;
+
+                    // RFC 9368 Section 4: version 0 is reserved for Version
+                    // Negotiation packets, so it can never be advertised and
+                    // its presence makes the parameter unparseable.
+                    if chosen_version == 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    let mut available_versions =
+                        Vec::with_capacity(val.cap() / 4);
+
+                    while val.cap() > 0 {
+                        let version = val.get_u32()?;
+
+                        if version == 0 {
+                            return Err(Error::InvalidTransportParam);
+                        }
+
+                        // RFC 9368 Section 3: a client's list is ordered by
+                        // descending preference and a server's ordering has no
+                        // semantics, so the wire order is kept as received.
+                        available_versions.push(version);
+                    }
+
+                    tp.version_information = Some(VersionInformation {
+                        chosen_version,
+                        available_versions,
+                    });
                 },
 
                 0x0020 => {
@@ -542,6 +621,23 @@ impl TransportParams {
             if let Some(scid) = &tp.retry_source_connection_id {
                 TransportParams::encode_param(&mut b, 0x0010, scid.len())?;
                 b.put_bytes(scid)?;
+            }
+        }
+
+        if let Some(version_information) = &tp.version_information {
+            // RFC 9368 Section 3: the value is the 4-byte Chosen Version
+            // followed by one 4-byte entry per Available Version, so it is
+            // 4 + 4 * N bytes long. The multiplication cannot overflow, since
+            // a `Vec` that already holds `n` versions occupies `4 * n` bytes
+            // of memory.
+            let len = 4 + 4 * version_information.available_versions.len();
+            TransportParams::encode_param(&mut b, 0x0011, len)?;
+            b.put_u32(version_information.chosen_version)?;
+
+            // The order of the list is meaningful, so emit the versions
+            // exactly as they are stored.
+            for version in &version_information.available_versions {
+                b.put_u32(*version)?;
             }
         }
 

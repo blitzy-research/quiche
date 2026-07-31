@@ -54,6 +54,7 @@ fn transport_params() {
         retry_source_connection_id: Some(b"retry".to_vec().into()),
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        version_information: None,
     };
 
     let mut raw_params = [42; 256];
@@ -84,6 +85,7 @@ fn transport_params() {
         retry_source_connection_id: None,
         max_datagram_frame_size: Some(32),
         unknown_params: Default::default(),
+        version_information: None,
     };
 
     let mut raw_params = [42; 256];
@@ -12485,4 +12487,573 @@ fn connect_custom_client_dcid_too_short() {
         &mut client_config,
     );
     assert_eq!(client.err().unwrap(), Error::InvalidDcidInitialization);
+}
+
+// RFC 9368 Section 3: the version_information value is a 4-byte Chosen
+// Version followed by one 4-byte entry per Available Version, and the order
+// of that list is part of the value.
+#[test]
+fn version_information_roundtrip() {
+    // The list is deliberately not in ascending order: a client lists the
+    // versions it supports by descending preference, so a codec that sorted
+    // or otherwise rearranged the list would fail here.
+    let available_versions = vec![0x5a5a_5a5a, PROTOCOL_VERSION];
+
+    let tp = TransportParams {
+        version_information: Some(VersionInformation {
+            chosen_version: PROTOCOL_VERSION,
+            available_versions: available_versions.clone(),
+        }),
+        ..Default::default()
+    };
+
+    // Encode an otherwise identical baseline so the length delta isolates
+    // version_information.
+    let base = TransportParams::default();
+
+    let mut raw_base = [42; 256];
+    let raw_base = TransportParams::encode(&base, true, &mut raw_base).unwrap();
+
+    let mut raw_params = [42; 256];
+    let raw_params = TransportParams::encode(&tp, true, &mut raw_params).unwrap();
+
+    // The value is 4 + 4 * N bytes long and both varints are one byte wide,
+    // so two available versions cost fourteen bytes on the wire.
+    assert_eq!(
+        raw_params.len(),
+        raw_base.len() + 2 + 4 + 4 * available_versions.len()
+    );
+
+    // An absent parameter emits nothing at all, and this one is emitted last
+    // since max_datagram_frame_size is absent too, so the trailing bytes are
+    // the parameter's wire form byte for byte.
+    let golden: [u8; 14] = [
+        0x11, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x5a, 0x5a, 0x5a, 0x5a, 0x00, 0x00,
+        0x00, 0x01,
+    ];
+    assert_eq!(&raw_params[raw_base.len()..], &golden[..]);
+
+    let new_tp = TransportParams::decode(raw_params, false, None).unwrap();
+
+    assert_eq!(new_tp, tp);
+    assert_eq!(
+        new_tp.version_information,
+        Some(VersionInformation {
+            chosen_version: PROTOCOL_VERSION,
+            available_versions: available_versions.clone(),
+        })
+    );
+
+    let mut re_encoded = [42; 256];
+    let re_encoded =
+        TransportParams::encode(&new_tp, true, &mut re_encoded).unwrap();
+
+    assert_eq!(re_encoded, raw_params);
+
+    // The parameter is not role specific, so the same value survives the
+    // client to server direction as well.
+    let mut raw_client_params = [42; 256];
+    let raw_client_params =
+        TransportParams::encode(&tp, false, &mut raw_client_params).unwrap();
+    let new_tp = TransportParams::decode(raw_client_params, true, None).unwrap();
+
+    assert_eq!(
+        new_tp.version_information,
+        Some(VersionInformation {
+            chosen_version: PROTOCOL_VERSION,
+            available_versions,
+        })
+    );
+}
+
+// RFC 9368 Section 3: a hand-written encoding of the wire format decodes to
+// the value it describes.
+#[test]
+fn version_information_golden_decode() {
+    // Build the bytes by hand so decoding is tested independently of the
+    // encoder.
+    let raw_params = [
+        0x11, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x5a, 0x5a,
+        0x5a, 0x5a,
+    ];
+
+    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
+
+    assert_eq!(
+        tp.version_information,
+        Some(VersionInformation {
+            chosen_version: 0x0000_0001,
+            available_versions: vec![0x0000_0001, 0x5a5a_5a5a],
+        })
+    );
+
+    // The identifier is recognised, so the parameter is decoded as a known
+    // one: decoding the same bytes with the unknown parameter tracker enabled
+    // must leave that tracker empty.
+    let tp =
+        TransportParams::decode(raw_params.as_slice(), false, Some(128)).unwrap();
+
+    assert_eq!(
+        tp.version_information,
+        Some(VersionInformation {
+            chosen_version: 0x0000_0001,
+            available_versions: vec![0x0000_0001, 0x5a5a_5a5a],
+        })
+    );
+    assert!(tp.unknown_params.unwrap().parameters.is_empty());
+}
+
+// RFC 9368 Section 3: the Available Versions field may be empty, since a
+// server is not required to include its Chosen Version in its own list, so a
+// 4-byte value is legal and yields an empty list rather than an error.
+#[test]
+fn version_information_empty_available_versions() {
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00, 0x01];
+
+    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
+
+    let version_information = VersionInformation {
+        chosen_version: 0x0000_0001,
+        available_versions: vec![],
+    };
+
+    assert_eq!(tp.version_information, Some(version_information.clone()));
+
+    // The empty list survives encoding too, where the value is the Chosen
+    // Version alone and the parameter occupies six wire bytes. The three
+    // parameters a default set would otherwise carry are zeroed here, so the
+    // encoding is exactly the parameter under test.
+    let tp = TransportParams {
+        max_udp_payload_size: 0,
+        ack_delay_exponent: 0,
+        max_ack_delay: 0,
+        version_information: Some(version_information.clone()),
+        ..Default::default()
+    };
+
+    let mut encoded = [42; 256];
+    let encoded = TransportParams::encode(&tp, true, &mut encoded).unwrap();
+
+    assert_eq!(&encoded[..], &raw_params[..]);
+
+    let tp = TransportParams {
+        version_information: Some(version_information),
+        ..Default::default()
+    };
+
+    let mut encoded = [42; 256];
+    let encoded = TransportParams::encode(&tp, true, &mut encoded).unwrap();
+    let encoded_len = encoded.len();
+
+    assert_eq!(encoded[encoded_len - 6..], raw_params);
+}
+
+// RFC 9368 Section 4: malformed values are parsing failures that map to
+// TRANSPORT_PARAMETER_ERROR (0x8), never VERSION_NEGOTIATION_ERROR (0x11).
+#[test]
+fn version_information_malformed_rejected() {
+    // The Available Versions region is one byte long, i.e. the value length
+    // is not a multiple of four.
+    let raw_params = [0x11, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The value is shorter than the mandatory Chosen Version.
+    let raw_params = [0x11, 0x03, 0x00, 0x00, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The value is empty, so it carries no Chosen Version at all.
+    let raw_params = [0x11, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The Chosen Version is zero, which is reserved for Version Negotiation
+    // packets and can never be advertised.
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // An Available Version is zero, which is reserved for the same reason.
+    let raw_params = [0x11, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // A zero Available Version is rejected wherever it sits in the list, so a
+    // list whose valid prefix is longer is refused too: the decoder must
+    // check every entry rather than only the first one.
+    let raw_params = [
+        0x11, 0x0c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+        0x00, 0x00,
+    ];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The parameter may appear only once, so a repeated identifier is
+    // rejected even when both copies are individually well formed.
+    let raw_params = [
+        0x11, 0x04, 0x00, 0x00, 0x00, 0x01, 0x11, 0x04, 0x00, 0x00, 0x00, 0x01,
+    ];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    assert_eq!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::TransportParameterError as u64
+    );
+    assert_ne!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::VersionNegotiationError as u64
+    );
+}
+
+// RFC 9368 Section 4: a client must reject a server whose Chosen Version is
+// not the version the connection is using, and must do so with
+// VERSION_NEGOTIATION_ERROR (0x11).
+#[rstest]
+fn version_information_chosen_version_mismatch(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    // The server re-encodes its transport parameters when processing the
+    // client's first Initial, so the injected value reaches the wire.
+    pipe.server.local_transport_params.version_information =
+        Some(VersionInformation {
+            chosen_version: 0x5a5a_5a5a,
+            available_versions: vec![0x5a5a_5a5a, PROTOCOL_VERSION],
+        });
+    assert_eq!(pipe.server.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Err(Error::VersionNegotiation));
+
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::VersionNegotiationError as u64,
+            reason: vec![],
+        })
+    );
+
+    // The downgrade is refused before the peer's parameters are applied, so
+    // they are never exposed to the application either.
+    assert!(pipe.client.peer_transport_params().is_none());
+
+    // The rejection is delivered on the wire rather than only recorded
+    // locally, so the server observes the same code and the same empty reason
+    // phrase in the CONNECTION_CLOSE frame it receives.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(
+        pipe.server.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::VersionNegotiationError as u64,
+            reason: vec![],
+        })
+    );
+}
+
+// RFC 9368 Section 4: a Chosen Version equal to the version in use is
+// accepted, and the decoded value becomes visible to the endpoint.
+#[rstest]
+fn version_information_chosen_version_match(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    let version_information = VersionInformation {
+        chosen_version: PROTOCOL_VERSION,
+        available_versions: vec![PROTOCOL_VERSION, 0x5a5a_5a5a],
+    };
+
+    pipe.server.local_transport_params.version_information =
+        Some(version_information.clone());
+    assert_eq!(pipe.server.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.client.local_error(), None);
+
+    // The handshake completing is not enough on its own: the parameter must
+    // actually have reached the client, otherwise the assertion above would
+    // hold even if it never did. Vec equality is order sensitive, so the list
+    // order is pinned here too.
+    let peer_params = pipe.client.peer_transport_params().unwrap();
+    assert_eq!(peer_params.version_information, Some(version_information));
+}
+
+// RFC 9368 Section 3: the Available Versions field holds as many versions as
+// the value length describes, so a long list decodes entry by entry in wire
+// order and the encoder is bounded by the space it is given.
+#[test]
+fn version_information_many_available_versions() {
+    // A bounded list, long enough that an off-by-one or a rearrangement in
+    // the decode loop would show up, and with distinct entries so that the
+    // order is observable.
+    let available_versions: Vec<u32> =
+        (0..32_u32).map(|i| 0x5a5a_0000 + i).collect();
+
+    let version_information = VersionInformation {
+        chosen_version: PROTOCOL_VERSION,
+        available_versions: available_versions.clone(),
+    };
+
+    // Build the value by hand so the decoder is pinned independently of this
+    // crate's own encoder. The value is 4 + 4 * 32 = 132 bytes long, which
+    // does not fit in a one-byte varint, so the length is written as the
+    // two-byte varint 0x4084.
+    let mut raw_params = vec![0x11, 0x40, 132];
+    raw_params.extend_from_slice(&PROTOCOL_VERSION.to_be_bytes());
+
+    for version in &available_versions {
+        raw_params.extend_from_slice(&version.to_be_bytes());
+    }
+
+    assert_eq!(raw_params.len(), 3 + 4 + 4 * 32);
+
+    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
+
+    assert_eq!(tp.version_information, Some(version_information.clone()));
+    assert_eq!(
+        tp.version_information.unwrap().available_versions.len(),
+        available_versions.len()
+    );
+
+    let tp = TransportParams {
+        max_udp_payload_size: 0,
+        ack_delay_exponent: 0,
+        max_ack_delay: 0,
+        version_information: Some(version_information),
+        ..Default::default()
+    };
+
+    let mut encoded = [42; 256];
+    let encoded = TransportParams::encode(&tp, true, &mut encoded).unwrap();
+
+    assert_eq!(encoded, &raw_params[..]);
+
+    // A list that does not fit in the space available is reported rather than
+    // silently truncated: transport parameters are serialised into a fixed
+    // buffer, so the encoder must fail cleanly when it runs out of room.
+    let encoded_len = encoded.len();
+    let mut too_small = vec![42; encoded_len - 1];
+
+    assert_eq!(
+        TransportParams::encode(&tp, true, &mut too_small),
+        Err(Error::BufferTooShort)
+    );
+}
+
+// RFC 9368 Section 4: a malformed value seen during a real handshake closes
+// the connection with TRANSPORT_PARAMETER_ERROR (0x8) and an empty reason
+// phrase, which is what keeps it distinguishable from a version downgrade.
+#[rstest]
+fn version_information_malformed_connection_error(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    // The encoder emits whatever the local parameters hold, so a Chosen
+    // Version of zero reaches the client as a malformed value rather than as
+    // a version mismatch.
+    pipe.server.local_transport_params.version_information =
+        Some(VersionInformation {
+            chosen_version: 0,
+            available_versions: vec![PROTOCOL_VERSION],
+        });
+    assert_eq!(pipe.server.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
+
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::TransportParameterError as u64,
+            reason: vec![],
+        })
+    );
+
+    // The parameters are rejected before they are applied, so they are never
+    // exposed to the application.
+    assert!(pipe.client.peer_transport_params().is_none());
+
+    // The close reaches the peer, which observes TRANSPORT_PARAMETER_ERROR
+    // and not the VERSION_NEGOTIATION_ERROR that a downgrade would produce.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(
+        pipe.server.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::TransportParameterError as u64,
+            reason: vec![],
+        })
+    );
+
+    // The same holds when the malformed part is an Available Version that the
+    // decoder only reaches part way through the list, i.e. after it has
+    // already accepted a valid Chosen Version and a valid entry.
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    pipe.server.local_transport_params.version_information =
+        Some(VersionInformation {
+            chosen_version: PROTOCOL_VERSION,
+            available_versions: vec![PROTOCOL_VERSION, 0],
+        });
+    assert_eq!(pipe.server.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Err(Error::InvalidTransportParam));
+
+    assert_eq!(
+        pipe.client.local_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::TransportParameterError as u64,
+            reason: vec![],
+        })
+    );
+    assert!(pipe.client.peer_transport_params().is_none());
+}
+
+// RFC 9368 Section 4: comparing the Chosen Version against the version in
+// use is the client's obligation alone, so a server that receives a Chosen
+// Version different from the version in use accepts it and the handshake
+// completes.
+#[rstest]
+fn version_information_server_ignores_chosen_version(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    let version_information = VersionInformation {
+        chosen_version: 0x5a5a_5a5a,
+        available_versions: vec![0x5a5a_5a5a, PROTOCOL_VERSION],
+    };
+
+    pipe.client.local_transport_params.version_information =
+        Some(version_information.clone());
+    assert_eq!(pipe.client.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.server.local_error(), None);
+
+    // The value reached the server, so the handshake succeeding is the server
+    // declining to apply a client-only obligation rather than the parameter
+    // never arriving.
+    let peer_params = pipe.server.peer_transport_params().unwrap();
+    assert_eq!(peer_params.version_information, Some(version_information));
+}
+
+// RFC 9368 Section 4: the framing of the value is part of what makes it well
+// formed, so a length that does not describe the bytes that follow is a
+// parsing failure too, and RFC 9000 Section 20.1 makes a badly formatted
+// transport parameter a TRANSPORT_PARAMETER_ERROR (0x8) rather than a generic
+// decoding failure.
+#[test]
+fn version_information_malformed_framing_rejected() {
+    // The declared value length is four, but only three bytes follow it.
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The declared value length is eight, but only four bytes follow it, so
+    // the truncation happens part way through the Available Versions.
+    let raw_params = [0x11, 0x08, 0x00, 0x00, 0x00, 0x01];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The identifier is not followed by a length at all.
+    let raw_params = [0x11];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The length itself is incomplete: 0x40 introduces a two-byte varint and
+    // the second byte is missing.
+    let raw_params = [0x11, 0x40];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The declared value length is 2^32 + 4, of which four bytes follow.
+    //
+    // The low 32 bits of that length are exactly four, so a conversion of the
+    // length to a 32-bit `usize` that kept only those bits would leave the
+    // number of bytes that are actually present: the value would frame
+    // successfully and be accepted on such a target while being rejected on a
+    // 64-bit one. The length is converted with a checked conversion, so the
+    // rejection below does not depend on the width of `usize`.
+    assert_eq!(((1_u64 << 32) + 4) % (1 << 32), 4);
+
+    let raw_params = [
+        0x11, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        0x01,
+    ];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The same four value bytes with an honest length are accepted, so the
+    // rejections above are caused by the framing and not by the value.
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00, 0x01];
+    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
+
+    assert_eq!(
+        tp.version_information,
+        Some(VersionInformation {
+            chosen_version: 0x0000_0001,
+            available_versions: vec![],
+        })
+    );
+
+    // The framing is read the same way for every identifier, so a parameter
+    // defined by RFC 9000 is refused identically: the close code does not
+    // depend on which parameter was malformed. `initial_max_data` (0x04)
+    // declares four bytes here and carries one.
+    let raw_params = [0x04, 0x04, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // Every one of those rejections closes with TRANSPORT_PARAMETER_ERROR,
+    // which is what distinguishes a malformed parameter both from a version
+    // downgrade and from a generic protocol violation.
+    assert_eq!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::TransportParameterError as u64
+    );
+    assert_ne!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::VersionNegotiationError as u64
+    );
+    assert_ne!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::ProtocolViolation as u64
+    );
 }

@@ -147,18 +147,27 @@ impl<'a> Iterator for UnknownTransportParameterIterator<'a> {
     }
 }
 
-/// QUIC Version Information, as per RFC 9368 Section 3.
+/// QUIC Version Information.
 ///
-/// Carries the version the sender selected for the current connection, along
-/// with the versions the sender is able to use.
+/// The value of the `version_information` transport parameter, as defined in
+/// [RFC 9368](https://www.rfc-editor.org/rfc/rfc9368.html#section-3), which an
+/// endpoint uses to advertise the version it selected for the connection and
+/// the versions it supports.
+///
+/// The Available Versions are held as a sequence rather than a set because
+/// their order is part of the value: a client lists them in order of
+/// descending preference.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VersionInformation {
     /// The version the sender is using for the current connection.
     pub chosen_version: u32,
 
-    /// The versions the sender supports, in wire order. A client orders this
-    /// list by descending preference; a server's list need not contain its
-    /// own Chosen Version, and is allowed to be empty.
+    /// The versions the sender supports, in the order they appear on the
+    /// wire, i.e. as received from (or as they will be sent to) the peer.
+    ///
+    /// A client orders this list by descending preference, so the order is
+    /// part of the value and is never rearranged. A server is not required
+    /// to include its Chosen Version in the list, and the list may be empty.
     pub available_versions: Vec<u32>,
 }
 
@@ -203,7 +212,7 @@ pub struct TransportParams {
     pub max_datagram_frame_size: Option<u64>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
-    /// Version Information, as per RFC 9368 Section 3, if any.
+    /// Version Information, if any, as per RFC 9368 Section 3.
     pub version_information: Option<VersionInformation>,
     // pub preferred_address: ...,
 }
@@ -385,26 +394,32 @@ impl TransportParams {
                     tp.retry_source_connection_id = Some(val.to_vec().into());
                 },
 
+                // Version Information, as per RFC 9368 Section 3: a 32-bit
+                // Chosen Version followed by the sender's Available Versions,
+                // each 32 bits long.
                 0x0011 => {
-                    // The value is a 4-byte Chosen Version followed by the
-                    // Available Versions, each 4 bytes long, as per RFC 9368
-                    // Section 3. The list is allowed to be empty, so only
-                    // the Chosen Version is mandatory.
+                    // RFC 9368 Section 4: the value must carry a Chosen
+                    // Version and a whole number of Available Versions.
+                    // The Available Versions field may be empty, so a
+                    // 4-byte value is legal.
                     if val.cap() < 4 || val.cap() % 4 != 0 {
                         return Err(Error::InvalidTransportParam);
                     }
 
                     let chosen_version = val.get_u32()?;
 
-                    // A version of 0 is invalid, as per RFC 9368 Section 4.
+                    // RFC 9368 Section 4: version 0 is reserved for Version
+                    // Negotiation packets, so it can never be advertised and
+                    // its presence makes the parameter unparseable.
                     if chosen_version == 0 {
                         return Err(Error::InvalidTransportParam);
                     }
 
+                    // The remaining capacity is a whole number of versions,
+                    // so this bound is exact.
                     let mut available_versions =
                         Vec::with_capacity(val.cap() / 4);
 
-                    // The order of the list carries meaning, so preserve it.
                     while val.cap() > 0 {
                         let version = val.get_u32()?;
 
@@ -412,6 +427,9 @@ impl TransportParams {
                             return Err(Error::InvalidTransportParam);
                         }
 
+                        // RFC 9368 Section 3: a client's list is ordered by
+                        // descending preference and a server's ordering has no
+                        // semantics, so the wire order is kept as received.
                         available_versions.push(version);
                     }
 
@@ -600,17 +618,19 @@ impl TransportParams {
             }
         }
 
-        // The value is the Chosen Version followed by the Available Versions,
-        // in order, each 4 bytes long, as per RFC 9368 Section 3.
-        if let Some(vi) = &tp.version_information {
-            TransportParams::encode_param(
-                &mut b,
-                0x0011,
-                4 + 4 * vi.available_versions.len(),
-            )?;
-            b.put_u32(vi.chosen_version)?;
+        if let Some(version_information) = &tp.version_information {
+            // RFC 9368 Section 3: the value is the 4-byte Chosen Version
+            // followed by one 4-byte entry per Available Version, so it is
+            // 4 + 4 * N bytes long. The multiplication cannot overflow, since
+            // a `Vec` that already holds `n` versions occupies `4 * n` bytes
+            // of memory.
+            let len = 4 + 4 * version_information.available_versions.len();
+            TransportParams::encode_param(&mut b, 0x0011, len)?;
+            b.put_u32(version_information.chosen_version)?;
 
-            for version in &vi.available_versions {
+            // The order of the list is meaningful, so emit the versions
+            // exactly as they are stored.
+            for version in &version_information.available_versions {
                 b.put_u32(*version)?;
             }
         }

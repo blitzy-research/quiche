@@ -117,7 +117,8 @@ pub enum Error {
     InvalidDcidInitialization,
 
     /// The peer's Version Information carried a Chosen Version that does not
-    /// match the version in use, i.e. a downgrade, as per RFC 9368 Section 4.
+    /// match the version in use for the connection, i.e. a version downgrade
+    /// was attempted, as per RFC 9368 Section 4.
     VersionNegotiation,
 }
 
@@ -183,7 +184,11 @@ pub enum WireErrorCode {
     /// CONNECTION_CLOSE frame carrying this code except when the path does
     /// not support a large enough MTU.
     NoViablePath         = 0x10,
-    /// An endpoint encountered an error negotiating version, as per RFC 9368.
+    /// An endpoint received a `version_information` transport parameter whose
+    /// Chosen Version does not match the version in use for the connection.
+    ///
+    /// As defined in
+    /// [RFC9368](https://www.rfc-editor.org/rfc/rfc9368.html#section-4).
     VersionNegotiationError = 0x11,
 }
 

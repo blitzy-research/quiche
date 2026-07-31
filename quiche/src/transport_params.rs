@@ -267,25 +267,7 @@ impl TransportParams {
             }
             seen_params.insert(id);
 
-            // RFC 9368 Section 4 requires malformed version_information
-            // framing to produce a transport parameter error. Parse the
-            // length explicitly with a checked conversion so oversized
-            // declarations cannot wrap on narrow targets or claim more bytes
-            // than are present.
-            let mut val = if id == 0x0011 {
-                let value_len = params
-                    .get_varint()
-                    .map_err(|_| Error::InvalidTransportParam)?;
-
-                let value_len = usize::try_from(value_len)
-                    .map_err(|_| Error::InvalidTransportParam)?;
-
-                params
-                    .get_bytes(value_len)
-                    .map_err(|_| Error::InvalidTransportParam)?
-            } else {
-                params.get_bytes_with_varint_length()?
-            };
+            let mut val = params.get_bytes_with_varint_length()?;
 
             match id {
                 0x0000 => {

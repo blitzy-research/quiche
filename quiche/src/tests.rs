@@ -12783,66 +12783,6 @@ fn version_information_chosen_version_match(
     assert_eq!(peer_params.version_information, Some(version_information));
 }
 
-// RFC 9368 Section 4: the framing of the value is part of what makes it
-// well formed, so a length that does not describe the bytes that follow is a
-// parsing failure as well, and must be reported as TRANSPORT_PARAMETER_ERROR
-// (0x8) rather than as a generic decoding failure.
-#[test]
-fn version_information_malformed_framing_rejected() {
-    // The declared value length is four, but only three bytes follow it.
-    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00];
-    assert_eq!(
-        TransportParams::decode(raw_params.as_slice(), false, None),
-        Err(Error::InvalidTransportParam)
-    );
-
-    // The length itself is incomplete: 0x40 introduces a two-byte varint and
-    // the second byte is missing.
-    let raw_params = [0x11, 0x40];
-    assert_eq!(
-        TransportParams::decode(raw_params.as_slice(), false, None),
-        Err(Error::InvalidTransportParam)
-    );
-
-    // The declared value length is 2^32 + 4, of which four bytes follow.
-    //
-    // The low 32 bits of that length are exactly four, so an unchecked
-    // conversion of the length to a 32-bit `usize` would truncate it to the
-    // number of bytes that are actually present: the value would frame
-    // successfully and be accepted on such a target while being rejected on a
-    // 64-bit one. The decoder converts the length with a checked conversion
-    // and then verifies the declared bytes are present, so the rejection
-    // below does not depend on the width of `usize`.
-    assert_eq!(((1_u64 << 32) + 4) % (1 << 32), 4);
-
-    let raw_params = [
-        0x11, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-        0x01,
-    ];
-    assert_eq!(
-        TransportParams::decode(raw_params.as_slice(), false, None),
-        Err(Error::InvalidTransportParam)
-    );
-
-    // The same four value bytes with an honest length are accepted, so the
-    // rejections above are caused by the framing and not by the value.
-    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00, 0x01];
-    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
-
-    assert_eq!(
-        tp.version_information,
-        Some(VersionInformation {
-            chosen_version: 0x0000_0001,
-            available_versions: vec![],
-        })
-    );
-
-    assert_eq!(
-        Error::InvalidTransportParam.to_wire(),
-        WireErrorCode::TransportParameterError as u64
-    );
-}
-
 // RFC 9368 Section 3: the Available Versions field holds as many versions as
 // the value length describes, so a long list decodes entry by entry in wire
 // order and the encoder is bounded by the space it is given.
@@ -12962,4 +12902,33 @@ fn version_information_malformed_connection_error(
         })
     );
     assert!(pipe.client.peer_transport_params().is_none());
+}
+
+// RFC 9368 Section 4: comparing the Chosen Version against the version in
+// use is the client's obligation alone, so a server that receives a Chosen
+// Version different from the version in use accepts it and the handshake
+// completes.
+#[rstest]
+fn version_information_server_ignores_chosen_version(
+    #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+) {
+    let mut pipe = test_utils::Pipe::new(cc_algorithm_name).unwrap();
+
+    let version_information = VersionInformation {
+        chosen_version: 0x5a5a_5a5a,
+        available_versions: vec![0x5a5a_5a5a, PROTOCOL_VERSION],
+    };
+
+    pipe.client.local_transport_params.version_information =
+        Some(version_information.clone());
+    assert_eq!(pipe.client.encode_transport_params(), Ok(()));
+
+    assert_eq!(pipe.handshake(), Ok(()));
+    assert_eq!(pipe.server.local_error(), None);
+
+    // The value reached the server, so the handshake succeeding is the server
+    // declining to apply a client-only obligation rather than the parameter
+    // never arriving.
+    let peer_params = pipe.server.peer_transport_params().unwrap();
+    assert_eq!(peer_params.version_information, Some(version_information));
 }

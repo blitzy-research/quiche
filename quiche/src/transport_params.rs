@@ -267,21 +267,11 @@ impl TransportParams {
             }
             seen_params.insert(id);
 
-            // The value is prefixed with its length, encoded as a varint.
-            //
-            // RFC 9368 Section 4 makes any malformed `version_information` a
-            // parsing failure, which must be reported as a transport
-            // parameter error, so that parameter's framing is validated here
-            // instead of being taken on trust: the declared length is read as
-            // a `u64` and converted with a checked conversion, so an
-            // oversized declaration can neither wrap on a target whose
-            // `usize` is narrower than 64 bits nor frame fewer bytes than the
-            // peer declared. Rejection is therefore independent of the
-            // pointer width: an oversized length fails either the conversion
-            // or the presence check below.
-            //
-            // Every other parameter keeps the framing, and the error, that it
-            // already had.
+            // RFC 9368 Section 4 requires malformed version_information
+            // framing to produce a transport parameter error. Parse the
+            // length explicitly with a checked conversion so oversized
+            // declarations cannot wrap on narrow targets or claim more bytes
+            // than are present.
             let mut val = if id == 0x0011 {
                 let value_len = params
                     .get_varint()
@@ -443,8 +433,6 @@ impl TransportParams {
                         return Err(Error::InvalidTransportParam);
                     }
 
-                    // The remaining capacity is a whole number of versions,
-                    // so this bound is exact.
                     let mut available_versions =
                         Vec::with_capacity(val.cap() / 4);
 

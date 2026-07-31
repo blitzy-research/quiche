@@ -7729,6 +7729,18 @@ impl<F: BufFactory> Connection<F> {
             }
         }
 
+        // Validate version_information.
+        //
+        // A client MUST validate that the server's Chosen Version matches
+        // the version in use, as per RFC 9368 Section 4.
+        if !self.is_server {
+            if let Some(version_information) = &peer_params.version_information {
+                if version_information.chosen_version != self.version {
+                    return Err(Error::VersionNegotiation);
+                }
+            }
+        }
+
         self.process_peer_transport_params(peer_params)?;
 
         self.parsed_peer_transport_params = true;
@@ -9290,6 +9302,7 @@ pub use crate::transport_params::TransportParams;
 pub use crate::transport_params::UnknownTransportParameter;
 pub use crate::transport_params::UnknownTransportParameterIterator;
 pub use crate::transport_params::UnknownTransportParameters;
+pub use crate::transport_params::VersionInformation;
 
 pub use crate::buffers::BufFactory;
 pub use crate::buffers::BufSplit;

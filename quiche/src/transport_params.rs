@@ -267,7 +267,35 @@ impl TransportParams {
             }
             seen_params.insert(id);
 
-            let mut val = params.get_bytes_with_varint_length()?;
+            // The value is prefixed with its length, encoded as a varint.
+            //
+            // RFC 9368 Section 4 makes any malformed `version_information` a
+            // parsing failure, which must be reported as a transport
+            // parameter error, so that parameter's framing is validated here
+            // instead of being taken on trust: the declared length is read as
+            // a `u64` and converted with a checked conversion, so an
+            // oversized declaration can neither wrap on a target whose
+            // `usize` is narrower than 64 bits nor frame fewer bytes than the
+            // peer declared. Rejection is therefore independent of the
+            // pointer width: an oversized length fails either the conversion
+            // or the presence check below.
+            //
+            // Every other parameter keeps the framing, and the error, that it
+            // already had.
+            let mut val = if id == 0x0011 {
+                let value_len = params
+                    .get_varint()
+                    .map_err(|_| Error::InvalidTransportParam)?;
+
+                let value_len = usize::try_from(value_len)
+                    .map_err(|_| Error::InvalidTransportParam)?;
+
+                params
+                    .get_bytes(value_len)
+                    .map_err(|_| Error::InvalidTransportParam)?
+            } else {
+                params.get_bytes_with_varint_length()?
+            };
 
             match id {
                 0x0000 => {

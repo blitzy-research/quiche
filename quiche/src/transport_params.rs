@@ -26,6 +26,7 @@
 
 //! Transport parameters handling as per RFC 9000 Section 7.4
 //! Part of the Cryptographic and Transport Handshake
+//! The version_information parameter is defined by RFC 9368 Section 3
 
 use std::collections::HashSet;
 use std::mem::size_of;
@@ -146,6 +147,21 @@ impl<'a> Iterator for UnknownTransportParameterIterator<'a> {
     }
 }
 
+/// QUIC Version Information, as per RFC 9368 Section 3.
+///
+/// Carries the version the sender selected for the current connection, along
+/// with the versions the sender is able to use.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VersionInformation {
+    /// The version the sender is using for the current connection.
+    pub chosen_version: u32,
+
+    /// The versions the sender supports, in wire order. A client orders this
+    /// list by descending preference; a server's list need not contain its
+    /// own Chosen Version, and is allowed to be empty.
+    pub available_versions: Vec<u32>,
+}
+
 /// QUIC Transport Parameters
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransportParams {
@@ -187,6 +203,8 @@ pub struct TransportParams {
     pub max_datagram_frame_size: Option<u64>,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
+    /// Version Information, as per RFC 9368 Section 3, if any.
+    pub version_information: Option<VersionInformation>,
     // pub preferred_address: ...,
 }
 
@@ -211,6 +229,7 @@ impl Default for TransportParams {
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
             unknown_params: Default::default(),
+            version_information: None,
         }
     }
 }
@@ -364,6 +383,42 @@ impl TransportParams {
                     }
 
                     tp.retry_source_connection_id = Some(val.to_vec().into());
+                },
+
+                0x0011 => {
+                    // The value is a 4-byte Chosen Version followed by the
+                    // Available Versions, each 4 bytes long, as per RFC 9368
+                    // Section 3. The list is allowed to be empty, so only
+                    // the Chosen Version is mandatory.
+                    if val.cap() < 4 || val.cap() % 4 != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    let chosen_version = val.get_u32()?;
+
+                    // A version of 0 is invalid, as per RFC 9368 Section 4.
+                    if chosen_version == 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+
+                    let mut available_versions =
+                        Vec::with_capacity(val.cap() / 4);
+
+                    // The order of the list carries meaning, so preserve it.
+                    while val.cap() > 0 {
+                        let version = val.get_u32()?;
+
+                        if version == 0 {
+                            return Err(Error::InvalidTransportParam);
+                        }
+
+                        available_versions.push(version);
+                    }
+
+                    tp.version_information = Some(VersionInformation {
+                        chosen_version,
+                        available_versions,
+                    });
                 },
 
                 0x0020 => {
@@ -542,6 +597,21 @@ impl TransportParams {
             if let Some(scid) = &tp.retry_source_connection_id {
                 TransportParams::encode_param(&mut b, 0x0010, scid.len())?;
                 b.put_bytes(scid)?;
+            }
+        }
+
+        // The value is the Chosen Version followed by the Available Versions,
+        // in order, each 4 bytes long, as per RFC 9368 Section 3.
+        if let Some(vi) = &tp.version_information {
+            TransportParams::encode_param(
+                &mut b,
+                0x0011,
+                4 + 4 * vi.available_versions.len(),
+            )?;
+            b.put_u32(vi.chosen_version)?;
+
+            for version in &vi.available_versions {
+                b.put_u32(*version)?;
             }
         }
 

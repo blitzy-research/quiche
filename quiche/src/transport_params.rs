@@ -267,7 +267,15 @@ impl TransportParams {
             }
             seen_params.insert(id);
 
-            let mut val = params.get_bytes_with_varint_length()?;
+            // A value whose declared length does not describe the bytes that
+            // follow it is badly formatted, which RFC 9000 Section 20.1 makes
+            // a TRANSPORT_PARAMETER_ERROR, and which RFC 9368 Section 4
+            // requires for a Version Information value that is too short.
+            // The mapping is applied to the shared framing step, so the close
+            // code is the same whichever parameter is malformed.
+            let mut val = params
+                .get_bytes_with_varint_length()
+                .map_err(|_| Error::InvalidTransportParam)?;
 
             match id {
                 0x0000 => {

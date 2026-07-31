@@ -12753,6 +12753,21 @@ fn version_information_chosen_version_mismatch(
     // The downgrade is refused before the peer's parameters are applied, so
     // they are never exposed to the application either.
     assert!(pipe.client.peer_transport_params().is_none());
+
+    // The rejection is delivered on the wire rather than only recorded
+    // locally, so the server observes the same code and the same empty reason
+    // phrase in the CONNECTION_CLOSE frame it receives.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(
+        pipe.server.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::VersionNegotiationError as u64,
+            reason: vec![],
+        })
+    );
 }
 
 // RFC 9368 Section 4: a Chosen Version equal to the version in use is
@@ -12879,6 +12894,20 @@ fn version_information_malformed_connection_error(
     // exposed to the application.
     assert!(pipe.client.peer_transport_params().is_none());
 
+    // The close reaches the peer, which observes TRANSPORT_PARAMETER_ERROR
+    // and not the VERSION_NEGOTIATION_ERROR that a downgrade would produce.
+    let flight = test_utils::emit_flight(&mut pipe.client).unwrap();
+    test_utils::process_flight(&mut pipe.server, flight).unwrap();
+
+    assert_eq!(
+        pipe.server.peer_error(),
+        Some(&ConnectionError {
+            is_app: false,
+            error_code: WireErrorCode::TransportParameterError as u64,
+            reason: vec![],
+        })
+    );
+
     // The same holds when the malformed part is an Available Version that the
     // decoder only reaches part way through the list, i.e. after it has
     // already accepted a valid Chosen Version and a valid entry.
@@ -12931,4 +12960,100 @@ fn version_information_server_ignores_chosen_version(
     // never arriving.
     let peer_params = pipe.server.peer_transport_params().unwrap();
     assert_eq!(peer_params.version_information, Some(version_information));
+}
+
+// RFC 9368 Section 4: the framing of the value is part of what makes it well
+// formed, so a length that does not describe the bytes that follow is a
+// parsing failure too, and RFC 9000 Section 20.1 makes a badly formatted
+// transport parameter a TRANSPORT_PARAMETER_ERROR (0x8) rather than a generic
+// decoding failure.
+#[test]
+fn version_information_malformed_framing_rejected() {
+    // The declared value length is four, but only three bytes follow it.
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The declared value length is eight, but only four bytes follow it, so
+    // the truncation happens part way through the Available Versions.
+    let raw_params = [0x11, 0x08, 0x00, 0x00, 0x00, 0x01];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The identifier is not followed by a length at all.
+    let raw_params = [0x11];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The length itself is incomplete: 0x40 introduces a two-byte varint and
+    // the second byte is missing.
+    let raw_params = [0x11, 0x40];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The declared value length is 2^32 + 4, of which four bytes follow.
+    //
+    // The low 32 bits of that length are exactly four, so a conversion of the
+    // length to a 32-bit `usize` that kept only those bits would leave the
+    // number of bytes that are actually present: the value would frame
+    // successfully and be accepted on such a target while being rejected on a
+    // 64-bit one. The length is converted with a checked conversion, so the
+    // rejection below does not depend on the width of `usize`.
+    assert_eq!(((1_u64 << 32) + 4) % (1 << 32), 4);
+
+    let raw_params = [
+        0x11, 0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
+        0x01,
+    ];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // The same four value bytes with an honest length are accepted, so the
+    // rejections above are caused by the framing and not by the value.
+    let raw_params = [0x11, 0x04, 0x00, 0x00, 0x00, 0x01];
+    let tp = TransportParams::decode(raw_params.as_slice(), false, None).unwrap();
+
+    assert_eq!(
+        tp.version_information,
+        Some(VersionInformation {
+            chosen_version: 0x0000_0001,
+            available_versions: vec![],
+        })
+    );
+
+    // The framing is read the same way for every identifier, so a parameter
+    // defined by RFC 9000 is refused identically: the close code does not
+    // depend on which parameter was malformed. `initial_max_data` (0x04)
+    // declares four bytes here and carries one.
+    let raw_params = [0x04, 0x04, 0x00];
+    assert_eq!(
+        TransportParams::decode(raw_params.as_slice(), false, None),
+        Err(Error::InvalidTransportParam)
+    );
+
+    // Every one of those rejections closes with TRANSPORT_PARAMETER_ERROR,
+    // which is what distinguishes a malformed parameter both from a version
+    // downgrade and from a generic protocol violation.
+    assert_eq!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::TransportParameterError as u64
+    );
+    assert_ne!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::VersionNegotiationError as u64
+    );
+    assert_ne!(
+        Error::InvalidTransportParam.to_wire(),
+        WireErrorCode::ProtocolViolation as u64
+    );
 }

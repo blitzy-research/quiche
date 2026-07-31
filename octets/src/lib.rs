@@ -243,9 +243,17 @@ impl<'a> Octets<'a> {
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer, where `len` is an unsigned variable-length integer prefix
     /// in network byte-order.
+    ///
+    /// A varint can encode a length that no `usize` can hold, so the
+    /// conversion is checked: an unchecked cast would silently keep only the
+    /// low bits of such a length on a target with a narrow `usize`, and a
+    /// buffer holding just those few bytes would then be read successfully
+    /// instead of being rejected. A length that cannot be represented cannot
+    /// be available either, so it is reported like any other short buffer.
     pub fn get_bytes_with_varint_length(&mut self) -> Result<Octets<'a>> {
         let len = self.get_varint()?;
-        self.get_bytes(len as usize)
+        let len = usize::try_from(len).map_err(|_| BufferTooShortError)?;
+        self.get_bytes(len)
     }
 
     /// Decodes a Huffman-encoded value from the current offset.
@@ -588,9 +596,16 @@ impl<'a> OctetsMut<'a> {
     /// Reads `len` bytes from the current offset without copying and advances
     /// the buffer, where `len` is an unsigned variable-length integer prefix
     /// in network byte-order.
+    ///
+    /// The declared length is converted with a checked conversion, so a
+    /// length that no `usize` can hold is reported as a short buffer rather
+    /// than truncated, exactly as in [`Octets`].
+    ///
+    /// [`Octets`]: struct.Octets.html
     pub fn get_bytes_with_varint_length(&mut self) -> Result<Octets<'_>> {
         let len = self.get_varint()?;
-        self.get_bytes(len as usize)
+        let len = usize::try_from(len).map_err(|_| BufferTooShortError)?;
+        self.get_bytes(len)
     }
 
     /// Reads `len` bytes from the current offset without copying and without
@@ -1054,6 +1069,42 @@ mod tests {
         assert_eq!(b.off(), 10);
 
         assert!(b.get_bytes(2).is_err());
+    }
+
+    #[test]
+    fn get_bytes_with_varint_length() {
+        // The declared length describes the bytes that follow.
+        let d = [0x04, 1, 2, 3, 4, 5];
+        let mut b = Octets::with_slice(&d);
+
+        let value = b.get_bytes_with_varint_length().unwrap();
+
+        assert_eq!(value.as_ref(), [1, 2, 3, 4]);
+        assert_eq!(b.cap(), 1);
+
+        // A declared length longer than the bytes that follow is rejected.
+        let d = [0x04, 1, 2, 3];
+        let mut b = Octets::with_slice(&d);
+
+        assert!(b.get_bytes_with_varint_length().is_err());
+
+        // So is a length that no `usize` can hold, whatever the width of
+        // `usize` is: the eight-byte varint below declares 2^32 + 4 bytes, of
+        // which four follow. Keeping only the low 32 bits of that length
+        // would leave exactly the four bytes that are present, so an
+        // unchecked conversion would accept this buffer on a 32-bit target
+        // while rejecting it on a 64-bit one.
+        assert_eq!(((1_u64 << 32) + 4) % (1 << 32), 4);
+
+        let d = [0xc0, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x04, 1, 2, 3, 4];
+        let mut b = Octets::with_slice(&d);
+
+        assert!(b.get_bytes_with_varint_length().is_err());
+
+        let mut d = d;
+        let mut b = OctetsMut::with_slice(&mut d);
+
+        assert!(b.get_bytes_with_varint_length().is_err());
     }
 
     #[test]
